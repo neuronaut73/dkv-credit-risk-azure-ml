@@ -1,31 +1,31 @@
 """
-Explainability utilities for the DKV Mobility Azure ML interview case.
+Explainability for the frozen 10-feature compact HGB challenger.
 
-This script is intentionally separate from model training and selection.
+DKV Mobility Azure ML interview case.
 
-It produces two complementary views:
-
-1. Selected nonlinear model:
-   Model-agnostic permutation importance on the already frozen holdout model.
-   This measures how much ROC-AUC deteriorates when one original input feature
-   is randomly permuted.
-
-2. Transparent reference model:
-   A separate logistic regression is fitted on the training partition only.
-   Numeric features are standardized. Categorical features use reference
-   coding (drop="first") so that category coefficients have a clear reference
-   category.
+This script:
+1. Reads the final 10-feature set selected from the expanded 36-feature space.
+2. Recreates the deterministic engineered features from src/features.py.
+3. Fits the compact HGB once on the full 80% training partition.
+4. Saves the fitted compact model.
+5. Evaluates it on the untouched 20% holdout.
+6. Produces model-level explainability:
+   - permutation importance on the holdout (ROC-AUC decrease),
+   - one-way partial-dependence plots for the most important numeric features,
+   - optional SHAP global importance if shap is installed and --with-shap is used.
 
 Important:
-- The selected production candidate is NOT refitted here.
-- Holdout permutation importance is for post-hoc interpretation only.
-- Do not use holdout explainability results to tune or re-select the model.
+- Feature selection is NOT repeated here.
+- The selected 10-feature set is read from the prior nested-CV experiment.
+- The holdout is NOT used for feature selection or tuning.
+- Explainability outputs describe model behaviour, not causality.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import joblib
@@ -34,10 +34,33 @@ import numpy as np
 import pandas as pd
 
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.inspection import permutation_importance
-from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from features import (  # noqa: E402
+    ENGINEERED_FEATURES,
+    add_domain_features,
+)
 
 
 TARGET_COLUMN = "default"
@@ -48,7 +71,7 @@ CATEGORICAL_FEATURES = [
     "marriage",
 ]
 
-NUMERIC_FEATURES = [
+ORIGINAL_NUMERIC_FEATURES = [
     "limit_bal",
     "age",
     "pay_0",
@@ -71,92 +94,231 @@ NUMERIC_FEATURES = [
     "pay_amt6",
 ]
 
+EXPANDED_NUMERIC_FEATURES = (
+    ORIGINAL_NUMERIC_FEATURES
+    + ENGINEERED_FEATURES
+)
 
-def load_partition(
-    path: str,
-) -> tuple[pd.DataFrame, pd.Series]:
-    """Load a prepared train/test partition."""
+EXPANDED_FEATURES = (
+    EXPANDED_NUMERIC_FEATURES
+    + CATEGORICAL_FEATURES
+)
 
-    df = pd.read_csv(path)
 
-    if TARGET_COLUMN not in df.columns:
-        raise ValueError(
-            f"Data does not contain target column '{TARGET_COLUMN}'."
+def load_compact_feature_set(
+    feature_set_json: str,
+) -> list[str]:
+    """Load the frozen expanded top-10 feature set."""
+
+    payload = json.loads(
+        Path(feature_set_json).read_text(
+            encoding="utf-8"
         )
-
-    X = df.drop(columns=[TARGET_COLUMN])
-    y = df[TARGET_COLUMN].astype(int)
-
-    expected_features = set(
-        NUMERIC_FEATURES + CATEGORICAL_FEATURES
     )
 
-    if set(X.columns) != expected_features:
+    try:
+        features = payload[
+            "expanded"
+        ][
+            "top_10"
+        ]
+    except KeyError as exc:
         raise ValueError(
-            "Feature schema does not match the expected training schema."
+            "Expected JSON structure "
+            "payload['expanded']['top_10']."
+        ) from exc
+
+    if len(features) != 10:
+        raise ValueError(
+            f"Expected exactly 10 features, found {len(features)}."
         )
 
-    return X, y
+    unknown = sorted(
+        set(features)
+        - set(EXPANDED_FEATURES)
+    )
+
+    if unknown:
+        raise ValueError(
+            f"Unknown features in compact set: {unknown}"
+        )
+
+    return list(features)
 
 
-def calculate_permutation_importance(
-    model_pipeline,
+def build_compact_pipeline(
+    selected_features: list[str],
+    random_state: int,
+) -> Pipeline:
+    """Build the same compact HGB architecture used in CV."""
+
+    selected_set = set(
+        selected_features
+    )
+
+    numeric_features = [
+        feature
+        for feature in EXPANDED_NUMERIC_FEATURES
+        if feature in selected_set
+    ]
+
+    categorical_features = [
+        feature
+        for feature in CATEGORICAL_FEATURES
+        if feature in selected_set
+    ]
+
+    transformers = []
+
+    if numeric_features:
+        transformers.append(
+            (
+                "numeric",
+                StandardScaler(),
+                numeric_features,
+            )
+        )
+
+    if categorical_features:
+        transformers.append(
+            (
+                "categorical",
+                OneHotEncoder(
+                    handle_unknown="ignore",
+                    sparse_output=False,
+                ),
+                categorical_features,
+            )
+        )
+
+    if not transformers:
+        raise ValueError(
+            "Compact feature set is empty."
+        )
+
+    preprocessor = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+    )
+
+    classifier = HistGradientBoostingClassifier(
+        learning_rate=0.05,
+        max_iter=200,
+        random_state=random_state,
+    )
+
+    return Pipeline(
+        steps=[
+            (
+                "feature_transformer",
+                preprocessor,
+            ),
+            (
+                "classifier",
+                classifier,
+            ),
+        ]
+    )
+
+
+def calculate_holdout_metrics(
+    model: Pipeline,
     X_test: pd.DataFrame,
     y_test: pd.Series,
-    n_repeats: int,
-    random_state: int,
-) -> pd.DataFrame:
-    """
-    Calculate model-agnostic feature importance for the selected model.
+    threshold: float = 0.5,
+) -> dict:
+    """Calculate final holdout metrics for the compact challenger."""
 
-    Importance is measured as the reduction in holdout ROC-AUC after
-    permuting one ORIGINAL input feature at a time. Because the complete
-    sklearn Pipeline is evaluated, permutation happens before the fitted
-    feature transformer.
-    """
+    probability = model.predict_proba(
+        X_test
+    )[:, 1]
 
-    result = permutation_importance(
-        model_pipeline,
-        X_test,
+    prediction = (
+        probability >= threshold
+    ).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(
         y_test,
-        scoring="roc_auc",
-        n_repeats=n_repeats,
-        random_state=random_state,
-        n_jobs=-1,
-    )
+        prediction,
+        labels=[0, 1],
+    ).ravel()
 
-    importance_df = pd.DataFrame(
-        {
-            "feature": X_test.columns,
-            "importance_mean": result.importances_mean,
-            "importance_std": result.importances_std,
-        }
-    )
+    return {
+        "accuracy": float(
+            accuracy_score(
+                y_test,
+                prediction,
+            )
+        ),
+        "roc_auc": float(
+            roc_auc_score(
+                y_test,
+                probability,
+            )
+        ),
+        "pr_auc": float(
+            average_precision_score(
+                y_test,
+                probability,
+            )
+        ),
+        "precision": float(
+            precision_score(
+                y_test,
+                prediction,
+                zero_division=0,
+            )
+        ),
+        "recall": float(
+            recall_score(
+                y_test,
+                prediction,
+                zero_division=0,
+            )
+        ),
+        "f1": float(
+            f1_score(
+                y_test,
+                prediction,
+                zero_division=0,
+            )
+        ),
+        "brier": float(
+            brier_score_loss(
+                y_test,
+                probability,
+            )
+        ),
+        "log_loss": float(
+            log_loss(
+                y_test,
+                probability,
+            )
+        ),
+        "threshold": float(
+            threshold
+        ),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
 
-    importance_df["abs_importance"] = (
-        importance_df["importance_mean"].abs()
-    )
 
-    return importance_df.sort_values(
-        "importance_mean",
-        ascending=False,
-    ).reset_index(drop=True)
-
-
-def plot_permutation_importance(
+def make_permutation_plot(
     importance_df: pd.DataFrame,
     output_path: Path,
-    top_n: int,
 ) -> None:
-    """Plot the most influential original features."""
+    """Plot source-level permutation importance."""
 
-    plot_df = (
-        importance_df
-        .head(top_n)
-        .sort_values("importance_mean", ascending=True)
+    plot_df = importance_df.sort_values(
+        "importance_mean",
+        ascending=True,
     )
 
-    fig, ax = plt.subplots(figsize=(9, 7))
+    fig, ax = plt.subplots(
+        figsize=(9, 6)
+    )
 
     ax.barh(
         plot_df["feature"],
@@ -164,176 +326,381 @@ def plot_permutation_importance(
         xerr=plot_df["importance_std"],
     )
 
-    ax.axvline(0.0, linewidth=1)
-    ax.set_xlabel("Decrease in ROC-AUC after permutation")
-    ax.set_ylabel("Original input feature")
+    ax.set_xlabel(
+        "Decrease in holdout ROC-AUC after permutation"
+    )
+    ax.set_ylabel(
+        "Compact-model feature"
+    )
     ax.set_title(
-        "Permutation Importance – Selected Holdout Model"
+        "Permutation Importance – Compact 10-Feature HGB"
     )
 
     fig.tight_layout()
     fig.savefig(
         output_path,
-        dpi=150,
+        dpi=160,
         bbox_inches="tight",
     )
     plt.close(fig)
 
 
-def build_interpretable_logistic_pipeline(
-    random_state: int,
-) -> Pipeline:
+def calculate_manual_pdp(
+    model: Pipeline,
+    X: pd.DataFrame,
+    feature: str,
+    grid_points: int = 20,
+) -> pd.DataFrame:
     """
-    Build a transparent logistic reference model.
+    Model-agnostic one-way partial-dependence approximation.
 
-    This is intentionally separate from the selected nonlinear model.
-
-    Numeric features are standardized, so their coefficients describe the
-    change in log-odds associated with a one-standard-deviation increase.
-
-    Categorical features use drop="first", making the omitted first category
-    the reference category for coefficient interpretation.
+    For every grid value, set the feature to that value for all observations
+    and record the average predicted default probability.
     """
 
-    feature_transformer = ColumnTransformer(
-        transformers=[
-            (
-                "numeric",
-                StandardScaler(),
-                NUMERIC_FEATURES,
-            ),
-            (
-                "categorical",
-                OneHotEncoder(
-                    handle_unknown="ignore",
-                    drop="first",
-                    sparse_output=False,
-                ),
-                CATEGORICAL_FEATURES,
-            ),
-        ],
-        remainder="drop",
-    )
-
-    return Pipeline(
-        steps=[
-            (
-                "feature_transformer",
-                feature_transformer,
-            ),
-            (
-                "classifier",
-                LogisticRegression(
-                    max_iter=2000,
-                    random_state=random_state,
-                ),
-            ),
-        ]
-    )
-
-
-def extract_logistic_coefficients(
-    logistic_pipeline: Pipeline,
-) -> tuple[pd.DataFrame, dict]:
-    """
-    Extract coefficients, odds ratios, and categorical reference levels.
-    """
-
-    feature_transformer = logistic_pipeline.named_steps[
-        "feature_transformer"
-    ]
-    classifier = logistic_pipeline.named_steps["classifier"]
-
-    raw_feature_names = (
-        feature_transformer.get_feature_names_out()
-    )
-
-    feature_names = [
-        name.replace("numeric__", "")
-        .replace("categorical__", "")
-        for name in raw_feature_names
+    series = X[
+        feature
     ]
 
-    coefficients = classifier.coef_[0]
-
-    coefficient_df = pd.DataFrame(
-        {
-            "feature": feature_names,
-            "coefficient": coefficients,
-            "odds_ratio": np.exp(coefficients),
-        }
-    )
-
-    coefficient_df["abs_coefficient"] = (
-        coefficient_df["coefficient"].abs()
-    )
-
-    coefficient_df["direction"] = np.where(
-        coefficient_df["coefficient"] >= 0,
-        "higher predicted default odds",
-        "lower predicted default odds",
-    )
-
-    coefficient_df = coefficient_df.sort_values(
-        "abs_coefficient",
-        ascending=False,
-    ).reset_index(drop=True)
-
-    categorical_encoder = (
-        feature_transformer
-        .named_transformers_["categorical"]
-    )
-
-    reference_categories = {}
-    for feature, category_values, drop_index in zip(
-        CATEGORICAL_FEATURES,
-        categorical_encoder.categories_,
-        categorical_encoder.drop_idx_,
-    ):
-        value = category_values[drop_index]
-        reference_categories[feature] = (
-            value.item()
-            if hasattr(value, "item")
-            else value
+    if feature in CATEGORICAL_FEATURES:
+        grid = np.array(
+            sorted(
+                series.dropna()
+                .unique()
+                .tolist()
+            )
+        )
+    else:
+        lower = float(
+            series.quantile(0.05)
+        )
+        upper = float(
+            series.quantile(0.95)
         )
 
-    return coefficient_df, reference_categories
+        if lower == upper:
+            grid = np.array(
+                [lower]
+            )
+        else:
+            grid = np.linspace(
+                lower,
+                upper,
+                grid_points,
+            )
 
+    rows = []
 
-def plot_logistic_coefficients(
-    coefficient_df: pd.DataFrame,
-    output_path: Path,
-    top_n: int,
-) -> None:
-    """Plot the largest logistic coefficients by absolute magnitude."""
+    for value in grid:
+        modified = X.copy()
+        modified[
+            feature
+        ] = value
 
-    plot_df = (
-        coefficient_df
-        .head(top_n)
-        .sort_values("coefficient", ascending=True)
+        mean_probability = float(
+            model.predict_proba(
+                modified
+            )[:, 1].mean()
+        )
+
+        rows.append(
+            {
+                "feature": feature,
+                "feature_value": (
+                    float(value)
+                    if np.issubdtype(
+                        np.asarray(value).dtype,
+                        np.number,
+                    )
+                    else str(value)
+                ),
+                "mean_predicted_default_probability": (
+                    mean_probability
+                ),
+            }
+        )
+
+    return pd.DataFrame(
+        rows
     )
 
-    fig, ax = plt.subplots(figsize=(9, 7))
+
+def make_pdp_plot(
+    pdp_df: pd.DataFrame,
+    feature: str,
+    output_path: Path,
+) -> None:
+    """Plot one-way partial dependence."""
+
+    fig, ax = plt.subplots(
+        figsize=(8, 5)
+    )
+
+    ax.plot(
+        pdp_df[
+            "feature_value"
+        ],
+        pdp_df[
+            "mean_predicted_default_probability"
+        ],
+        marker="o",
+    )
+
+    ax.set_xlabel(
+        feature
+    )
+    ax.set_ylabel(
+        "Mean predicted default probability"
+    )
+    ax.set_title(
+        f"Partial Dependence – {feature}"
+    )
+
+    fig.tight_layout()
+    fig.savefig(
+        output_path,
+        dpi=160,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+def transformed_to_source_feature(
+    transformed_name: str,
+) -> str:
+    """Map transformed feature names back to source-level features."""
+
+    if transformed_name.startswith(
+        "numeric__"
+    ):
+        return transformed_name.replace(
+            "numeric__",
+            "",
+            1,
+        )
+
+    if transformed_name.startswith(
+        "categorical__"
+    ):
+        remainder = transformed_name.replace(
+            "categorical__",
+            "",
+            1,
+        )
+
+        for feature in sorted(
+            CATEGORICAL_FEATURES,
+            key=len,
+            reverse=True,
+        ):
+            if (
+                remainder == feature
+                or remainder.startswith(
+                    f"{feature}_"
+                )
+            ):
+                return feature
+
+    raise ValueError(
+        "Could not map transformed feature "
+        f"'{transformed_name}'."
+    )
+
+
+def create_optional_shap_outputs(
+    model: Pipeline,
+    X_test: pd.DataFrame,
+    output_dir: Path,
+    max_rows: int,
+    random_state: int,
+) -> None:
+    """
+    Optional SHAP global importance for the HGB classifier.
+
+    SHAP values are calculated on transformed HGB inputs and then aggregated
+    back to the 10 source features.
+    """
+
+    try:
+        import shap
+    except ImportError:
+        print(
+            "\nSHAP requested, but package 'shap' is not installed."
+        )
+        print(
+            "Install it with: pip install shap"
+        )
+        return
+
+    sample_size = min(
+        max_rows,
+        len(X_test),
+    )
+
+    X_sample = X_test.sample(
+        n=sample_size,
+        random_state=random_state,
+    )
+
+    transformer = model.named_steps[
+        "feature_transformer"
+    ]
+    classifier = model.named_steps[
+        "classifier"
+    ]
+
+    transformed = transformer.transform(
+        X_sample
+    )
+
+    transformed_names = (
+        transformer.get_feature_names_out()
+    )
+
+    explainer = shap.TreeExplainer(
+        classifier
+    )
+
+    shap_values = explainer.shap_values(
+        transformed
+    )
+
+    if isinstance(
+        shap_values,
+        list,
+    ):
+        shap_values = shap_values[
+            -1
+        ]
+
+    shap_values = np.asarray(
+        shap_values
+    )
+
+    if shap_values.ndim == 3:
+        shap_values = shap_values[
+            :,
+            :,
+            -1,
+        ]
+
+    if shap_values.shape[1] != len(
+        transformed_names
+    ):
+        raise ValueError(
+            "Unexpected SHAP output shape."
+        )
+
+    source_features = []
+
+    for name in transformed_names:
+        source_features.append(
+            transformed_to_source_feature(
+                name
+            )
+        )
+
+    source_order = list(
+        X_test.columns
+    )
+
+    source_shap = np.zeros(
+        (
+            shap_values.shape[0],
+            len(source_order),
+        )
+    )
+
+    for transformed_index, source in enumerate(
+        source_features
+    ):
+        source_index = (
+            source_order.index(
+                source
+            )
+        )
+
+        source_shap[
+            :,
+            source_index
+        ] += shap_values[
+            :,
+            transformed_index
+        ]
+
+    mean_abs = np.mean(
+        np.abs(
+            source_shap
+        ),
+        axis=0,
+    )
+
+    shap_df = pd.DataFrame(
+        {
+            "feature": source_order,
+            "mean_abs_shap": (
+                mean_abs
+            ),
+        }
+    ).sort_values(
+        "mean_abs_shap",
+        ascending=False,
+    )
+
+    shap_df.to_csv(
+        output_dir
+        / "shap_global_importance.csv",
+        index=False,
+    )
+
+    plot_df = shap_df.sort_values(
+        "mean_abs_shap",
+        ascending=True,
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(9, 6)
+    )
 
     ax.barh(
         plot_df["feature"],
-        plot_df["coefficient"],
+        plot_df[
+            "mean_abs_shap"
+        ],
     )
 
-    ax.axvline(0.0, linewidth=1)
-    ax.set_xlabel("Logistic regression coefficient")
-    ax.set_ylabel("Transformed feature")
+    ax.set_xlabel(
+        "Mean absolute SHAP value"
+    )
+    ax.set_ylabel(
+        "Compact-model feature"
+    )
     ax.set_title(
-        "Transparent Logistic Reference – Largest Coefficients"
+        "SHAP Global Importance – Compact 10-Feature HGB"
     )
 
     fig.tight_layout()
     fig.savefig(
-        output_path,
-        dpi=150,
+        output_dir
+        / "shap_global_importance.png",
+        dpi=160,
         bbox_inches="tight",
     )
     plt.close(fig)
+
+    print(
+        "\nSHAP global importance:"
+    )
+    print(
+        shap_df.to_string(
+            index=False,
+            float_format=(
+                lambda value: (
+                    f"{value:.5f}"
+                )
+            ),
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -344,37 +711,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-data",
         type=str,
-        default="data/processed/train/train.csv",
+        default=(
+            "data/processed/train/train.csv"
+        ),
     )
 
     parser.add_argument(
         "--test-data",
         type=str,
-        default="data/processed/test/test.csv",
+        default=(
+            "data/processed/test/test.csv"
+        ),
     )
 
     parser.add_argument(
-        "--model-path",
+        "--feature-set-json",
         type=str,
-        default="outputs/model/model.joblib",
+        default=(
+            "outputs/budget_feature_selection/"
+            "candidate_final_feature_sets.json"
+        ),
     )
 
     parser.add_argument(
-        "--explain-output",
+        "--model-output",
         type=str,
-        default="outputs/explainability",
+        default=(
+            "outputs/model_compact_10"
+        ),
     )
 
     parser.add_argument(
-        "--n-repeats",
-        type=int,
-        default=10,
+        "--output-dir",
+        type=str,
+        default=(
+            "outputs/explainability_compact_10"
+        ),
     )
 
     parser.add_argument(
-        "--top-n",
+        "--permutation-repeats",
         type=int,
-        default=15,
+        default=20,
+    )
+
+    parser.add_argument(
+        "--pdp-features",
+        type=int,
+        default=4,
     )
 
     parser.add_argument(
@@ -383,177 +767,396 @@ def parse_args() -> argparse.Namespace:
         default=42,
     )
 
+    parser.add_argument(
+        "--with-shap",
+        action="store_true",
+        help=(
+            "Also calculate SHAP global importance "
+            "if the shap package is installed."
+        ),
+    )
+
+    parser.add_argument(
+        "--shap-max-rows",
+        type=int,
+        default=1500,
+    )
+
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    if args.n_repeats < 1:
-        raise ValueError("--n-repeats must be at least 1.")
+    selected_features = (
+        load_compact_feature_set(
+            args.feature_set_json
+        )
+    )
 
-    if args.top_n < 1:
-        raise ValueError("--top-n must be at least 1.")
+    print(
+        "Frozen compact feature set:"
+    )
+    for feature in selected_features:
+        feature_type = (
+            "engineered"
+            if feature
+            in ENGINEERED_FEATURES
+            else "original"
+        )
+        print(
+            f"  - {feature} "
+            f"[{feature_type}]"
+        )
 
-    output_dir = Path(args.explain_output)
+    train_df = pd.read_csv(
+        args.train_data
+    )
+    test_df = pd.read_csv(
+        args.test_data
+    )
+
+    for name, frame in [
+        (
+            "train",
+            train_df,
+        ),
+        (
+            "test",
+            test_df,
+        ),
+    ]:
+        if TARGET_COLUMN not in frame.columns:
+            raise ValueError(
+                f"{name} data does not "
+                f"contain '{TARGET_COLUMN}'."
+            )
+
+    X_train_raw = train_df.drop(
+        columns=[
+            TARGET_COLUMN
+        ]
+    )
+    y_train = train_df[
+        TARGET_COLUMN
+    ].astype(int)
+
+    X_test_raw = test_df.drop(
+        columns=[
+            TARGET_COLUMN
+        ]
+    )
+    y_test = test_df[
+        TARGET_COLUMN
+    ].astype(int)
+
+    X_train_expanded = (
+        add_domain_features(
+            X_train_raw
+        )
+    )
+    X_test_expanded = (
+        add_domain_features(
+            X_test_raw
+        )
+    )
+
+    X_train = X_train_expanded[
+        selected_features
+    ].copy()
+
+    X_test = X_test_expanded[
+        selected_features
+    ].copy()
+
+    model = build_compact_pipeline(
+        selected_features,
+        args.random_state,
+    )
+
+    print(
+        "\nFitting frozen compact HGB "
+        "on all training data..."
+    )
+
+    model.fit(
+        X_train,
+        y_train,
+    )
+
+    model_output = Path(
+        args.model_output
+    )
+    model_output.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    model_path = (
+        model_output
+        / "model.joblib"
+    )
+
+    joblib.dump(
+        model,
+        model_path,
+    )
+
+    output_dir = Path(
+        args.output_dir
+    )
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    print("Loading prepared train and holdout partitions...")
-
-    X_train, y_train = load_partition(
-        args.train_data,
-    )
-
-    X_test, y_test = load_partition(
-        args.test_data,
-    )
-
-    print(
-        f"Training observations: {len(X_train):,}"
-    )
-    print(
-        f"Holdout observations:  {len(X_test):,}"
-    )
-
-    print("\nLoading selected fitted model pipeline...")
-
-    selected_model_pipeline = joblib.load(
-        args.model_path,
-    )
-
-    print(
-        "Calculating holdout permutation importance "
-        f"({args.n_repeats} repeats)..."
-    )
-
-    importance_df = calculate_permutation_importance(
-        selected_model_pipeline,
-        X_test,
-        y_test,
-        args.n_repeats,
-        args.random_state,
-    )
-
-    importance_csv = (
-        output_dir / "permutation_importance.csv"
-    )
-    importance_plot = (
-        output_dir / "permutation_importance.png"
-    )
-
-    importance_df.to_csv(
-        importance_csv,
-        index=False,
-    )
-
-    plot_permutation_importance(
-        importance_df,
-        importance_plot,
-        args.top_n,
-    )
-
-    print("\nTop permutation-importance features:")
-    print(
-        importance_df[
-            [
-                "feature",
-                "importance_mean",
-                "importance_std",
-            ]
-        ]
-        .head(10)
-        .to_string(index=False)
-    )
-
-    print(
-        "\nFitting separate interpretable "
-        "logistic reference model on TRAINING data only..."
-    )
-
-    logistic_pipeline = (
-        build_interpretable_logistic_pipeline(
-            args.random_state
+    metrics = (
+        calculate_holdout_metrics(
+            model,
+            X_test,
+            y_test,
         )
     )
 
-    logistic_pipeline.fit(
-        X_train,
-        y_train,
-    )
-
-    (
-        coefficient_df,
-        reference_categories,
-    ) = extract_logistic_coefficients(
-        logistic_pipeline
-    )
-
-    coefficient_csv = (
-        output_dir / "logistic_coefficients.csv"
-    )
-    coefficient_plot = (
-        output_dir / "logistic_coefficients.png"
-    )
-    reference_path = (
-        output_dir / "logistic_reference_categories.json"
-    )
-
-    coefficient_df.to_csv(
-        coefficient_csv,
-        index=False,
-    )
-
-    plot_logistic_coefficients(
-        coefficient_df,
-        coefficient_plot,
-        args.top_n,
-    )
-
-    with reference_path.open(
+    with (
+        output_dir
+        / "holdout_metrics.json"
+    ).open(
         "w",
         encoding="utf-8",
     ) as file:
         json.dump(
-            reference_categories,
+            metrics,
             file,
             indent=2,
         )
 
-    print("\nLargest logistic coefficients:")
     print(
-        coefficient_df[
-            [
-                "feature",
-                "coefficient",
-                "odds_ratio",
-                "direction",
-            ]
-        ]
-        .head(10)
-        .to_string(index=False)
+        "\nCompact 10-feature holdout metrics"
+    )
+    print(
+        "=================================="
     )
 
-    print("\nCategorical reference levels:")
-    for feature, reference in (
-        reference_categories.items()
-    ):
+    for key in [
+        "accuracy",
+        "roc_auc",
+        "pr_auc",
+        "precision",
+        "recall",
+        "f1",
+        "brier",
+        "log_loss",
+    ]:
         print(
-            f"  {feature}: {reference}"
+            f"{key:<10}: "
+            f"{metrics[key]:.4f}"
         )
 
     print(
-        f"\nExplainability artifacts written to: "
-        f"{output_dir}"
+        f"confusion : "
+        f"TN={metrics['tn']}, "
+        f"FP={metrics['fp']}, "
+        f"FN={metrics['fn']}, "
+        f"TP={metrics['tp']}"
     )
 
     print(
-        "\nInterpretation note:"
-        "\n- Permutation importance explains the selected nonlinear model."
-        "\n- Logistic coefficients explain the separate transparent reference model."
-        "\n- Neither should be interpreted as causal effects."
+        "\nCalculating permutation importance..."
+    )
+
+    permutation = (
+        permutation_importance(
+            estimator=model,
+            X=X_test,
+            y=y_test,
+            scoring="roc_auc",
+            n_repeats=(
+                args.permutation_repeats
+            ),
+            random_state=(
+                args.random_state
+            ),
+            n_jobs=-1,
+        )
+    )
+
+    importance_df = pd.DataFrame(
+        {
+            "feature": (
+                X_test.columns
+            ),
+            "importance_mean": (
+                permutation.importances_mean
+            ),
+            "importance_std": (
+                permutation.importances_std
+            ),
+            "feature_type": [
+                (
+                    "engineered"
+                    if feature
+                    in ENGINEERED_FEATURES
+                    else "original"
+                )
+                for feature in (
+                    X_test.columns
+                )
+            ],
+        }
+    ).sort_values(
+        "importance_mean",
+        ascending=False,
+    ).reset_index(
+        drop=True
+    )
+
+    importance_df.to_csv(
+        output_dir
+        / "permutation_importance.csv",
+        index=False,
+    )
+
+    make_permutation_plot(
+        importance_df,
+        output_dir
+        / "permutation_importance.png",
+    )
+
+    print(
+        "\nPermutation importance:"
+    )
+    print(
+        importance_df.to_string(
+            index=False,
+            float_format=(
+                lambda value: (
+                    f"{value:.5f}"
+                )
+            ),
+        )
+    )
+
+    # Prefer numeric features for PDPs; category effects can be added later.
+    top_pdp_features = [
+        feature
+        for feature in (
+            importance_df[
+                "feature"
+            ]
+        )
+        if feature
+        not in CATEGORICAL_FEATURES
+    ][
+        : args.pdp_features
+    ]
+
+    print(
+        "\nCreating PDPs for:"
+    )
+
+    for feature in (
+        top_pdp_features
+    ):
+        print(
+            f"  - {feature}"
+        )
+
+        pdp_df = (
+            calculate_manual_pdp(
+                model,
+                X_test,
+                feature,
+            )
+        )
+
+        pdp_df.to_csv(
+            output_dir
+            / f"pdp_{feature}.csv",
+            index=False,
+        )
+
+        make_pdp_plot(
+            pdp_df,
+            feature,
+            output_dir
+            / f"pdp_{feature}.png",
+        )
+
+    if args.with_shap:
+        create_optional_shap_outputs(
+            model=model,
+            X_test=X_test,
+            output_dir=output_dir,
+            max_rows=(
+                args.shap_max_rows
+            ),
+            random_state=(
+                args.random_state
+            ),
+        )
+
+    metadata = {
+        "model_role": (
+            "interpretable_compact_challenger"
+        ),
+        "feature_set_source": (
+            args.feature_set_json
+        ),
+        "selected_features": (
+            selected_features
+        ),
+        "model_path": str(
+            model_path
+        ),
+        "permutation_scoring": (
+            "roc_auc"
+        ),
+        "permutation_repeats": (
+            args.permutation_repeats
+        ),
+        "pdp_features": (
+            top_pdp_features
+        ),
+        "notes": [
+            (
+                "The compact 10-feature set was selected "
+                "before this explainability step."
+            ),
+            (
+                "The holdout is used for final evaluation "
+                "and post-hoc explanation, not tuning."
+            ),
+            (
+                "Permutation importance and SHAP describe "
+                "model behaviour, not causal effects."
+            ),
+            (
+                "Correlated features can share importance."
+            ),
+        ],
+    }
+
+    with (
+        output_dir
+        / "explainability_metadata.json"
+    ).open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            metadata,
+            file,
+            indent=2,
+        )
+
+    print(
+        f"\nCompact model written to: "
+        f"{model_path}"
+    )
+    print(
+        f"Explainability artifacts written to: "
+        f"{output_dir}"
     )
 
 

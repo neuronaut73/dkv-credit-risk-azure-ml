@@ -1,38 +1,39 @@
 """
-Sparsity-path experiment for the DKV Mobility Azure ML interview case.
+Sparsity-path experiment on the EXPANDED 36-feature space.
+
+DKV Mobility Azure ML interview case.
 
 Goal
 ----
-Find the smallest regularized logistic model whose discrimination remains
-close to the best model, rather than blindly selecting the absolute maximum
-ROC-AUC.
+Start from:
+- 23 original UCI features
+- 13 deterministic, domain-engineered features
 
-The experiment uses ONLY the 80% development/training partition.
-The untouched 20% holdout test set is never loaded.
+Then find the smallest sparse logistic model whose cross-validated
+discrimination remains close to the best model.
+
+Only the 80% training partition is used.
+The 20% holdout test set is never loaded.
 
 Method
 ------
-1. Evaluate a path of L1 and Elastic-Net logistic models with fixed C values.
-2. Use identical stratified 5-fold CV splits for every configuration.
-3. Record ROC-AUC, PR-AUC, Brier score, and number of selected ORIGINAL
+1. Add deterministic domain features from src/features.py.
+2. Evaluate a path of L1 and Elastic-Net logistic models.
+3. Use identical stratified 5-fold CV splits for every configuration.
+4. Record ROC-AUC, PR-AUC, Brier score, and number of selected SOURCE
    features for every configuration.
-4. Determine a near-optimal region using either:
-   - the one-standard-error rule (default), or
-   - a user-supplied ROC-AUC tolerance.
-5. Among near-optimal models, select the sparsest configuration.
-6. Refit that selected sparse configuration on the complete training partition.
-7. Save:
-   - regularization path,
-   - feature-selection stability,
-   - stable feature set,
-   - full-train selected feature set,
-   - fitted sparse reference model.
+5. Apply the one-standard-error rule (default) or a user-defined tolerance.
+6. Among near-optimal models, choose the sparsest configuration.
+7. Measure feature-selection stability across folds.
+8. Refit the selected sparse model on the full training partition.
+9. Persist the selected feature set for the compact-HGB experiment.
 
 Important
 ---------
-This is a development/model-selection experiment. The holdout is intentionally
-not used here. Final holdout performance must not be used to tune the feature
-subset.
+Feature engineering is deterministic and row-wise. No statistics are learned
+from the dataset before cross-validation.
+
+The holdout test set is intentionally not used here.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -64,6 +66,18 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from features import (  # noqa: E402
+    ENGINEERED_FEATURES,
+    add_domain_features,
+)
+
+
 TARGET_COLUMN = "default"
 
 CATEGORICAL_FEATURES = [
@@ -72,7 +86,7 @@ CATEGORICAL_FEATURES = [
     "marriage",
 ]
 
-NUMERIC_FEATURES = [
+ORIGINAL_NUMERIC_FEATURES = [
     "limit_bal",
     "age",
     "pay_0",
@@ -95,7 +109,15 @@ NUMERIC_FEATURES = [
     "pay_amt6",
 ]
 
-ALL_ORIGINAL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+EXPANDED_NUMERIC_FEATURES = (
+    ORIGINAL_NUMERIC_FEATURES
+    + ENGINEERED_FEATURES
+)
+
+ALL_EXPANDED_FEATURES = (
+    EXPANDED_NUMERIC_FEATURES
+    + CATEGORICAL_FEATURES
+)
 
 DEFAULT_C_GRID = [
     0.0003,
@@ -115,14 +137,14 @@ DEFAULT_ELASTIC_L1_RATIOS = [
 
 
 def build_feature_transformer() -> ColumnTransformer:
-    """Build preprocessing for regularized logistic regression."""
+    """Build preprocessing for the expanded 36-feature logistic model."""
 
     return ColumnTransformer(
         transformers=[
             (
                 "numeric",
                 StandardScaler(),
-                NUMERIC_FEATURES,
+                EXPANDED_NUMERIC_FEATURES,
             ),
             (
                 "categorical",
@@ -144,7 +166,7 @@ def build_sparse_pipeline(
     random_state: int,
     l1_ratio: float | None = None,
 ) -> Pipeline:
-    """Build one fixed point on the regularization path."""
+    """Build one fixed sparse-model configuration."""
 
     if penalty == "l1":
         classifier = LogisticRegression(
@@ -243,10 +265,17 @@ def calculate_metrics(
     }
 
 
-def transformed_to_original_feature(
+def transformed_to_source_feature(
     transformed_name: str,
 ) -> str:
-    """Map transformed sklearn feature names back to original inputs."""
+    """
+    Map transformed sklearn columns back to one source feature.
+
+    Examples:
+      numeric__pay_0 -> pay_0
+      numeric__max_delinquency -> max_delinquency
+      categorical__sex_2 -> sex
+    """
 
     if transformed_name.startswith(
         "numeric__"
@@ -289,7 +318,7 @@ def extract_selection(
     fitted_pipeline: Pipeline,
     zero_tolerance: float = 1e-10,
 ) -> dict:
-    """Extract non-zero transformed and original features."""
+    """Extract non-zero transformed and source features."""
 
     transformer = (
         fitted_pipeline.named_steps[
@@ -308,18 +337,19 @@ def extract_selection(
     coefficients = classifier.coef_[0]
 
     selected_transformed = []
-    selected_original = set()
+    selected_source = set()
     coefficient_rows = []
 
     for name, coefficient in zip(
         transformed_names,
         coefficients,
     ):
-        original = (
-            transformed_to_original_feature(
+        source_feature = (
+            transformed_to_source_feature(
                 name
             )
         )
+
         selected = (
             abs(coefficient)
             > zero_tolerance
@@ -328,7 +358,7 @@ def extract_selection(
         coefficient_rows.append(
             {
                 "transformed_feature": name,
-                "original_feature": original,
+                "source_feature": source_feature,
                 "coefficient": float(
                     coefficient
                 ),
@@ -338,6 +368,12 @@ def extract_selection(
                 "selected": bool(
                     selected
                 ),
+                "feature_type": (
+                    "engineered"
+                    if source_feature
+                    in ENGINEERED_FEATURES
+                    else "original"
+                ),
             }
         )
 
@@ -345,22 +381,22 @@ def extract_selection(
             selected_transformed.append(
                 name
             )
-            selected_original.add(
-                original
+            selected_source.add(
+                source_feature
             )
 
     return {
         "selected_transformed": (
             selected_transformed
         ),
-        "selected_original": sorted(
-            selected_original
+        "selected_source": sorted(
+            selected_source
         ),
         "n_selected_transformed": len(
             selected_transformed
         ),
-        "n_selected_original": len(
-            selected_original
+        "n_selected_source": len(
+            selected_source
         ),
         "coefficient_rows": (
             coefficient_rows
@@ -372,7 +408,7 @@ def create_candidate_grid(
     c_grid: list[float],
     elastic_l1_ratios: list[float],
 ) -> list[dict]:
-    """Create all sparse path configurations."""
+    """Create all L1 and Elastic-Net path configurations."""
 
     candidates = []
 
@@ -403,7 +439,7 @@ def create_candidate_grid(
 def candidate_id(
     candidate: dict,
 ) -> str:
-    """Create a stable readable candidate identifier."""
+    """Create a readable candidate ID."""
 
     if (
         candidate["model_family"]
@@ -427,7 +463,7 @@ def evaluate_candidate(
     cv_splits,
     random_state: int,
 ) -> dict:
-    """Evaluate one fixed sparse-model configuration."""
+    """Evaluate one fixed sparse configuration."""
 
     fold_records = []
     selection_counter = Counter()
@@ -494,7 +530,7 @@ def evaluate_candidate(
 
         selection_counter.update(
             selection[
-                "selected_original"
+                "selected_source"
             ]
         )
 
@@ -502,9 +538,9 @@ def evaluate_candidate(
             {
                 "fold": fold_number,
                 "metrics": metrics,
-                "n_selected_original": (
+                "n_selected_source": (
                     selection[
-                        "n_selected_original"
+                        "n_selected_source"
                     ]
                 ),
                 "n_selected_transformed": (
@@ -512,15 +548,17 @@ def evaluate_candidate(
                         "n_selected_transformed"
                     ]
                 ),
-                "selected_original": (
+                "selected_source": (
                     selection[
-                        "selected_original"
+                        "selected_source"
                     ]
                 ),
             }
         )
 
-    metric_names = [
+    summary = {}
+
+    for metric in [
         "accuracy",
         "roc_auc",
         "pr_auc",
@@ -528,38 +566,26 @@ def evaluate_candidate(
         "recall",
         "f1",
         "brier",
-    ]
-
-    summary = {}
-
-    for metric in metric_names:
+    ]:
         values = np.array(
             [
-                fold[
-                    "metrics"
-                ][metric]
-                for fold in (
-                    fold_records
-                )
+                fold["metrics"][metric]
+                for fold in fold_records
             ],
             dtype=float,
         )
 
         summary[
             f"{metric}_mean"
-        ] = float(
-            values.mean()
-        )
+        ] = float(values.mean())
         summary[
             f"{metric}_std"
-        ] = float(
-            values.std()
-        )
+        ] = float(values.std())
 
     selected_counts = np.array(
         [
             fold[
-                "n_selected_original"
+                "n_selected_source"
             ]
             for fold in fold_records
         ],
@@ -567,25 +593,17 @@ def evaluate_candidate(
     )
 
     summary[
-        "selected_original_mean"
-    ] = float(
-        selected_counts.mean()
-    )
+        "selected_source_mean"
+    ] = float(selected_counts.mean())
     summary[
-        "selected_original_std"
-    ] = float(
-        selected_counts.std()
-    )
+        "selected_source_std"
+    ] = float(selected_counts.std())
     summary[
-        "selected_original_min"
-    ] = int(
-        selected_counts.min()
-    )
+        "selected_source_min"
+    ] = int(selected_counts.min())
     summary[
-        "selected_original_max"
-    ] = int(
-        selected_counts.max()
-    )
+        "selected_source_max"
+    ] = int(selected_counts.max())
 
     stability = {
         feature: (
@@ -595,7 +613,7 @@ def evaluate_candidate(
             / len(cv_splits)
         )
         for feature in (
-            ALL_ORIGINAL_FEATURES
+            ALL_EXPANDED_FEATURES
         )
     }
 
@@ -603,9 +621,7 @@ def evaluate_candidate(
         "candidate": candidate,
         "folds": fold_records,
         "summary": summary,
-        "selection_stability": (
-            stability
-        ),
+        "selection_stability": stability,
     }
 
 
@@ -615,15 +631,7 @@ def select_parsimonious_candidate(
     roc_tolerance: float,
     n_folds: int,
 ) -> tuple[pd.Series, float, str]:
-    """
-    Select the sparsest near-optimal configuration.
-
-    one_se:
-        threshold = best mean ROC-AUC - standard error of the best candidate
-
-    tolerance:
-        threshold = best mean ROC-AUC - roc_tolerance
-    """
+    """Choose the sparsest configuration inside the near-optimal region."""
 
     best_index = (
         path_df["roc_auc_mean"]
@@ -633,35 +641,21 @@ def select_parsimonious_candidate(
         best_index
     ]
 
-    if (
-        selection_rule
-        == "one_se"
-    ):
+    if selection_rule == "one_se":
         best_se = (
-            best_row[
-                "roc_auc_std"
-            ]
-            / math.sqrt(
-                n_folds
-            )
+            best_row["roc_auc_std"]
+            / math.sqrt(n_folds)
         )
         threshold = (
-            best_row[
-                "roc_auc_mean"
-            ]
+            best_row["roc_auc_mean"]
             - best_se
         )
         description = (
             "one-standard-error rule"
         )
-    elif (
-        selection_rule
-        == "tolerance"
-    ):
+    elif selection_rule == "tolerance":
         threshold = (
-            best_row[
-                "roc_auc_mean"
-            ]
+            best_row["roc_auc_mean"]
             - roc_tolerance
         )
         description = (
@@ -680,12 +674,10 @@ def select_parsimonious_candidate(
         ] >= threshold
     ].copy()
 
-    # Primary objective: smallest model.
-    # Tie-breakers: higher ROC-AUC, higher PR-AUC, lower Brier.
     near_optimal = (
         near_optimal.sort_values(
             by=[
-                "selected_original_mean",
+                "selected_source_mean",
                 "roc_auc_mean",
                 "pr_auc_mean",
                 "brier_mean",
@@ -711,7 +703,7 @@ def plot_sparsity_frontier(
     selected_id: str,
     output_path: Path,
 ) -> None:
-    """Plot ROC-AUC against average number of selected original features."""
+    """Plot CV ROC-AUC against mean number of selected source features."""
 
     fig, ax = plt.subplots(
         figsize=(9, 6)
@@ -724,13 +716,13 @@ def plot_sparsity_frontier(
     ):
         group = (
             group.sort_values(
-                "selected_original_mean"
+                "selected_source_mean"
             )
         )
 
         ax.plot(
             group[
-                "selected_original_mean"
+                "selected_source_mean"
             ],
             group[
                 "roc_auc_mean"
@@ -751,7 +743,7 @@ def plot_sparsity_frontier(
     ax.scatter(
         [
             selected_row[
-                "selected_original_mean"
+                "selected_source_mean"
             ]
         ],
         [
@@ -765,13 +757,13 @@ def plot_sparsity_frontier(
     )
 
     ax.set_xlabel(
-        "Mean selected original features"
+        "Mean selected source features"
     )
     ax.set_ylabel(
         "5-fold CV ROC-AUC"
     )
     ax.set_title(
-        "Sparsity–Performance Frontier"
+        "Expanded Feature Space – Sparsity/Performance Frontier"
     )
     ax.legend()
 
@@ -820,7 +812,7 @@ def plot_metric_vs_c(
         "5-fold CV ROC-AUC"
     )
     ax.set_title(
-        "Regularization Path – ROC-AUC"
+        "Expanded Feature Space – Regularization Path"
     )
     ax.legend()
 
@@ -836,7 +828,7 @@ def plot_metric_vs_c(
 def parse_float_list(
     value: str,
 ) -> list[float]:
-    """Parse comma-separated float values."""
+    """Parse comma-separated floats."""
 
     return [
         float(item.strip())
@@ -862,7 +854,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=str,
         default=(
-            "outputs/sparsity_path"
+            "outputs/sparsity_path_36"
         ),
     )
 
@@ -885,9 +877,6 @@ def parse_args() -> argparse.Namespace:
             str(value)
             for value in DEFAULT_C_GRID
         ),
-        help=(
-            "Comma-separated C values."
-        ),
     )
 
     parser.add_argument(
@@ -898,10 +887,6 @@ def parse_args() -> argparse.Namespace:
             for value in (
                 DEFAULT_ELASTIC_L1_RATIOS
             )
-        ),
-        help=(
-            "Comma-separated Elastic-Net "
-            "l1_ratio values."
         ),
     )
 
@@ -918,20 +903,12 @@ def parse_args() -> argparse.Namespace:
         "--roc-tolerance",
         type=float,
         default=0.005,
-        help=(
-            "Used only with "
-            "--selection-rule tolerance."
-        ),
     )
 
     parser.add_argument(
         "--stability-threshold",
         type=float,
         default=0.80,
-        help=(
-            "Minimum fraction of CV folds "
-            "for a feature to be called stable."
-        ),
     )
 
     return parser.parse_args()
@@ -939,16 +916,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    if (
-        not 0
-        < args.stability_threshold
-        <= 1
-    ):
-        raise ValueError(
-            "--stability-threshold must "
-            "be in (0, 1]."
-        )
 
     c_grid = parse_float_list(
         args.c_grid
@@ -963,33 +930,40 @@ def main() -> None:
         args.train_data
     )
 
-    if (
-        TARGET_COLUMN
-        not in train_df.columns
-    ):
+    if TARGET_COLUMN not in train_df.columns:
         raise ValueError(
             f"Training data does not "
             f"contain '{TARGET_COLUMN}'."
         )
 
-    X = train_df.drop(
-        columns=[
-            TARGET_COLUMN
-        ]
+    X_raw = train_df.drop(
+        columns=[TARGET_COLUMN]
     )
     y = train_df[
         TARGET_COLUMN
     ].astype(int)
 
-    if (
-        set(X.columns)
-        != set(
-            ALL_ORIGINAL_FEATURES
+    expected_raw_features = set(
+        ORIGINAL_NUMERIC_FEATURES
+        + CATEGORICAL_FEATURES
+    )
+
+    if set(X_raw.columns) != expected_raw_features:
+        raise ValueError(
+            "Raw training feature schema "
+            "does not match expected schema."
         )
+
+    X = add_domain_features(
+        X_raw
+    )
+
+    if set(X.columns) != set(
+        ALL_EXPANDED_FEATURES
     ):
         raise ValueError(
-            "Training feature schema "
-            "does not match expected schema."
+            "Expanded feature schema "
+            "does not match expected 36 features."
         )
 
     print(
@@ -1001,16 +975,22 @@ def main() -> None:
         f"{y.mean():.2%}"
     )
     print(
-        f"Original input features: "
+        f"Original features: "
+        f"{X_raw.shape[1]}"
+    )
+    print(
+        f"Engineered features: "
+        f"{len(ENGINEERED_FEATURES)}"
+    )
+    print(
+        f"Expanded feature space: "
         f"{X.shape[1]}"
     )
 
     cv = StratifiedKFold(
         n_splits=args.cv_folds,
         shuffle=True,
-        random_state=(
-            args.random_state
-        ),
+        random_state=args.random_state,
     )
 
     cv_splits = list(
@@ -1020,11 +1000,9 @@ def main() -> None:
         )
     )
 
-    candidates = (
-        create_candidate_grid(
-            c_grid,
-            elastic_ratios,
-        )
+    candidates = create_candidate_grid(
+        c_grid,
+        elastic_ratios,
     )
 
     print(
@@ -1077,27 +1055,23 @@ def main() -> None:
             )
         )
 
-        row = {
-            "candidate_id": cid,
-            "model_family": (
-                candidate[
-                    "model_family"
-                ]
-            ),
-            "model_label": (
-                model_label
-            ),
-            "C": candidate["C"],
-            "l1_ratio": (
-                candidate[
-                    "l1_ratio"
-                ]
-            ),
-            **summary,
-        }
-
         path_rows.append(
-            row
+            {
+                "candidate_id": cid,
+                "model_family": (
+                    candidate[
+                        "model_family"
+                    ]
+                ),
+                "model_label": model_label,
+                "C": candidate["C"],
+                "l1_ratio": (
+                    candidate[
+                        "l1_ratio"
+                    ]
+                ),
+                **summary,
+            }
         )
 
         print(
@@ -1109,8 +1083,8 @@ def main() -> None:
             f"{summary['pr_auc_mean']:.4f}, "
             f"Brier="
             f"{summary['brier_mean']:.4f}, "
-            f"selected original="
-            f"{summary['selected_original_mean']:.1f}"
+            f"selected source features="
+            f"{summary['selected_source_mean']:.1f}"
         )
 
     path_df = pd.DataFrame(
@@ -1153,10 +1127,8 @@ def main() -> None:
     stable_features = sorted(
         [
             feature
-            for (
-                feature,
-                rate,
-            ) in stability.items()
+            for feature, rate
+            in stability.items()
             if rate
             >= args.stability_threshold
         ]
@@ -1187,9 +1159,7 @@ def main() -> None:
                     "l1_ratio"
                 ]
             ),
-            random_state=(
-                args.random_state
-            ),
+            random_state=args.random_state,
         )
     )
 
@@ -1214,7 +1184,7 @@ def main() -> None:
 
     path_df.to_csv(
         output_dir
-        / "sparsity_path.csv",
+        / "sparsity_path_36.csv",
         index=False,
     )
 
@@ -1222,6 +1192,12 @@ def main() -> None:
         [
             {
                 "feature": feature,
+                "feature_type": (
+                    "engineered"
+                    if feature
+                    in ENGINEERED_FEATURES
+                    else "original"
+                ),
                 "selection_rate": (
                     stability[
                         feature
@@ -1246,7 +1222,7 @@ def main() -> None:
                 ),
             }
             for feature in (
-                ALL_ORIGINAL_FEATURES
+                ALL_EXPANDED_FEATURES
             )
         ]
     ).sort_values(
@@ -1262,7 +1238,7 @@ def main() -> None:
 
     stability_df.to_csv(
         output_dir
-        / "selected_model_feature_stability.csv",
+        / "selected_model_feature_stability_36.csv",
         index=False,
     )
 
@@ -1272,11 +1248,14 @@ def main() -> None:
         ]
     ).to_csv(
         output_dir
-        / "selected_sparse_model_coefficients.csv",
+        / "selected_sparse_model_coefficients_36.csv",
         index=False,
     )
 
     feature_payload = {
+        "feature_space": (
+            "23 original + 13 engineered"
+        ),
         "selection_rule": (
             args.selection_rule
         ),
@@ -1305,14 +1284,17 @@ def main() -> None:
         ),
         "refit_full_train_features": (
             full_train_selection[
-                "selected_original"
+                "selected_source"
             ]
+        ),
+        "engineered_features_available": (
+            ENGINEERED_FEATURES
         ),
     }
 
     with (
         output_dir
-        / "selected_feature_set.json"
+        / "selected_feature_set_36.json"
     ).open(
         "w",
         encoding="utf-8",
@@ -1325,7 +1307,7 @@ def main() -> None:
 
     with (
         output_dir
-        / "all_path_results.json"
+        / "all_path_results_36.json"
     ).open(
         "w",
         encoding="utf-8",
@@ -1339,20 +1321,20 @@ def main() -> None:
     joblib.dump(
         final_sparse_pipeline,
         output_dir
-        / "selected_sparse_model.joblib",
+        / "selected_sparse_model_36.joblib",
     )
 
     plot_sparsity_frontier(
         path_df,
         selected_id,
         output_dir
-        / "sparsity_performance_frontier.png",
+        / "sparsity_performance_frontier_36.png",
     )
 
     plot_metric_vs_c(
         path_df,
         output_dir
-        / "regularization_path_roc_auc.png",
+        / "regularization_path_roc_auc_36.png",
     )
 
     best_row = path_df.loc[
@@ -1361,11 +1343,23 @@ def main() -> None:
         ].idxmax()
     ]
 
+    stable_engineered = [
+        feature
+        for feature in stable_features
+        if feature in ENGINEERED_FEATURES
+    ]
+
+    stable_original = [
+        feature
+        for feature in stable_features
+        if feature not in ENGINEERED_FEATURES
+    ]
+
     print(
-        "\n\nSparsity-path result"
+        "\n\nExpanded-space sparsity result"
     )
     print(
-        "===================="
+        "================================"
     )
     print(
         f"Best observed CV ROC-AUC: "
@@ -1377,6 +1371,7 @@ def main() -> None:
         f"({selection_description}): "
         f"{threshold:.4f}"
     )
+
     print(
         "\nSelected parsimonious model:"
     )
@@ -1396,8 +1391,8 @@ def main() -> None:
         f"{selected_row['brier_mean']:.4f}"
     )
     print(
-        f"  Mean selected original features: "
-        f"{selected_row['selected_original_mean']:.1f}"
+        f"  Mean selected source features: "
+        f"{selected_row['selected_source_mean']:.1f}"
     )
 
     print(
@@ -1405,9 +1400,22 @@ def main() -> None:
         f"(>={args.stability_threshold:.0%} folds): "
         f"{len(stable_features)}"
     )
-    for feature in (
-        stable_features
-    ):
+
+    print(
+        f"\nOriginal stable features "
+        f"({len(stable_original)}):"
+    )
+    for feature in stable_original:
+        print(
+            f"  - {feature}: "
+            f"{stability[feature]:.0%}"
+        )
+
+    print(
+        f"\nEngineered stable features "
+        f"({len(stable_engineered)}):"
+    )
+    for feature in stable_engineered:
         print(
             f"  - {feature}: "
             f"{stability[feature]:.0%}"
@@ -1415,26 +1423,34 @@ def main() -> None:
 
     print(
         "\nFeatures selected after refit "
-        "on all training data: "
-        f"{len(full_train_selection['selected_original'])}"
+        f"on all training data: "
+        f"{len(full_train_selection['selected_source'])}"
     )
     for feature in (
         full_train_selection[
-            "selected_original"
+            "selected_source"
         ]
     ):
+        feature_type = (
+            "engineered"
+            if feature
+            in ENGINEERED_FEATURES
+            else "original"
+        )
         print(
-            f"  - {feature}"
+            f"  - {feature} "
+            f"[{feature_type}]"
         )
 
     print(
         f"\nArtifacts written to: "
         f"{output_dir}"
     )
+
     print(
         "\nNext step:"
-        "\nUse selected_feature_set.json in the compact-HGB experiment."
-        "\nDo NOT inspect the holdout to choose between feature subsets."
+        "\nRun compact_hgb_experiment.py using selected_feature_set_36.json."
+        "\nDo NOT use the holdout to choose the feature subset."
     )
 
 

@@ -1,26 +1,21 @@
 """
-Compact-HGB experiment for the DKV Mobility Azure ML interview case.
+Compare three HGB variants on the same 5-fold CV splits:
 
-Goal
-----
-Compare the existing full 23-feature HistGradientBoosting model against a
-compact HistGradientBoosting model using the stable feature subset selected
-by sparsity_path_experiment.py.
+1. Full raw HGB:       23 original features
+2. Expanded HGB:       23 original + 13 engineered = 36 features
+3. Compact HGB:        stable subset selected from the 36-feature space
 
 Only the 80% training partition is used.
 The 20% holdout test set is never loaded.
 
-Both HGB candidates use:
-- identical 5-fold stratified CV splits,
-- identical model hyperparameters,
-- identical preprocessing rules,
-- the only difference is the input feature subset.
+The feature engineering is deterministic and row-wise.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -43,6 +38,18 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from features import (  # noqa: E402
+    ENGINEERED_FEATURES,
+    add_domain_features,
+)
+
+
 TARGET_COLUMN = "default"
 
 CATEGORICAL_FEATURES = [
@@ -51,7 +58,7 @@ CATEGORICAL_FEATURES = [
     "marriage",
 ]
 
-NUMERIC_FEATURES = [
+ORIGINAL_NUMERIC_FEATURES = [
     "limit_bal",
     "age",
     "pay_0",
@@ -74,8 +81,14 @@ NUMERIC_FEATURES = [
     "pay_amt6",
 ]
 
-ALL_FEATURES = (
-    NUMERIC_FEATURES
+RAW_FEATURES = (
+    ORIGINAL_NUMERIC_FEATURES
+    + CATEGORICAL_FEATURES
+)
+
+EXPANDED_FEATURES = (
+    ORIGINAL_NUMERIC_FEATURES
+    + ENGINEERED_FEATURES
     + CATEGORICAL_FEATURES
 )
 
@@ -84,25 +97,26 @@ def build_hgb_pipeline(
     selected_features: list[str],
     random_state: int,
 ) -> Pipeline:
-    """Build HGB using exactly the requested original input features."""
+    """Build HGB using exactly the requested source features."""
 
     selected_set = set(
         selected_features
     )
 
+    numeric_pool = (
+        ORIGINAL_NUMERIC_FEATURES
+        + ENGINEERED_FEATURES
+    )
+
     selected_numeric = [
         feature
-        for feature in (
-            NUMERIC_FEATURES
-        )
+        for feature in numeric_pool
         if feature in selected_set
     ]
 
     selected_categorical = [
         feature
-        for feature in (
-            CATEGORICAL_FEATURES
-        )
+        for feature in CATEGORICAL_FEATURES
         if feature in selected_set
     ]
 
@@ -136,9 +150,7 @@ def build_hgb_pipeline(
 
     transformer = (
         ColumnTransformer(
-            transformers=(
-                transformers
-            ),
+            transformers=transformers,
             remainder="drop",
         )
     )
@@ -228,7 +240,7 @@ def evaluate_model(
     y: pd.Series,
     cv_splits,
 ) -> dict:
-    """Evaluate one HGB model on fixed shared CV folds."""
+    """Evaluate one HGB candidate on the shared CV folds."""
 
     fold_records = []
 
@@ -300,9 +312,7 @@ def evaluate_model(
         values = np.array(
             [
                 record[metric]
-                for record in (
-                    fold_records
-                )
+                for record in fold_records
             ],
             dtype=float,
         )
@@ -324,64 +334,49 @@ def evaluate_model(
     }
 
 
-def build_fold_comparison(
-    full_result: dict,
-    compact_result: dict,
+def build_comparison_table(
+    results: dict,
 ) -> pd.DataFrame:
-    """Create paired fold-level comparison."""
+    """Create a fold-level table for all three HGB variants."""
 
     rows = []
 
-    for full_fold, compact_fold in zip(
-        full_result["folds"],
-        compact_result["folds"],
+    n_folds = len(
+        results[
+            "full_raw_hgb"
+        ][
+            "folds"
+        ]
+    )
+
+    for fold_index in range(
+        n_folds
     ):
         row = {
-            "fold": (
-                full_fold["fold"]
-            )
+            "fold": fold_index + 1
         }
 
-        for metric in [
-            "accuracy",
-            "roc_auc",
-            "pr_auc",
-            "precision",
-            "recall",
-            "f1",
-            "brier",
-        ]:
-            row[
-                f"full_{metric}"
-            ] = full_fold[
-                metric
-            ]
-            row[
-                f"compact_{metric}"
-            ] = compact_fold[
-                metric
-            ]
+        for model_name, result in (
+            results.items()
+        ):
+            fold = result[
+                "folds"
+            ][fold_index]
 
-            if metric == "brier":
-                improvement = (
-                    full_fold[metric]
-                    - compact_fold[
-                        metric
-                    ]
-                )
-            else:
-                improvement = (
-                    compact_fold[
-                        metric
-                    ]
-                    - full_fold[
-                        metric
-                    ]
-                )
-
-            row[
-                f"compact_improvement_{metric}"
-            ] = improvement
+            for metric in [
+                "accuracy",
+                "roc_auc",
+                "pr_auc",
+                "precision",
+                "recall",
+                "f1",
+                "brier",
+            ]:
+                row[
+                    f"{model_name}_{metric}"
+                ] = fold[
+                    metric
+                ]
 
         rows.append(
             row
@@ -392,56 +387,67 @@ def build_fold_comparison(
     )
 
 
-def plot_comparison(
-    comparison_df: pd.DataFrame,
+def plot_roc_auc_comparison(
+    results: dict,
     output_path: Path,
 ) -> None:
-    """Plot paired full-vs-compact ROC-AUC."""
+    """Plot mean ROC-AUC with fold variability."""
+
+    labels = [
+        "23 raw",
+        "36 expanded",
+        "compact selected",
+    ]
+
+    model_keys = [
+        "full_raw_hgb",
+        "expanded_hgb",
+        "compact_hgb",
+    ]
+
+    means = [
+        results[key][
+            "summary"
+        ][
+            "roc_auc_mean"
+        ]
+        for key in model_keys
+    ]
+
+    stds = [
+        results[key][
+            "summary"
+        ][
+            "roc_auc_std"
+        ]
+        for key in model_keys
+    ]
 
     x = np.arange(
-        len(comparison_df)
+        len(labels)
     )
-    width = 0.36
 
     fig, ax = plt.subplots(
         figsize=(9, 6)
     )
 
     ax.bar(
-        x - width / 2,
-        comparison_df[
-            "full_roc_auc"
-        ],
-        width,
-        label="Full HGB",
-    )
-    ax.bar(
-        x + width / 2,
-        comparison_df[
-            "compact_roc_auc"
-        ],
-        width,
-        label="Compact HGB",
+        x,
+        means,
+        yerr=stds,
+        capsize=5,
     )
 
     ax.set_xticks(
         x,
-        [
-            f"Fold {value}"
-            for value in (
-                comparison_df[
-                    "fold"
-                ]
-            )
-        ],
+        labels,
     )
     ax.set_ylabel(
-        "ROC-AUC"
+        "5-fold CV ROC-AUC"
     )
     ax.set_title(
-        "Full vs Compact HGB – Paired 5-Fold CV"
+        "HGB Comparison – Raw vs Expanded vs Compact"
     )
-    ax.legend()
 
     fig.tight_layout()
     fig.savefig(
@@ -469,8 +475,8 @@ def parse_args() -> argparse.Namespace:
         "--feature-set-json",
         type=str,
         default=(
-            "outputs/sparsity_path/"
-            "selected_feature_set.json"
+            "outputs/sparsity_path_36/"
+            "selected_feature_set_36.json"
         ),
     )
 
@@ -481,17 +487,13 @@ def parse_args() -> argparse.Namespace:
             "refit",
         ],
         default="stable",
-        help=(
-            "Use stable CV features or "
-            "features selected after full-train refit."
-        ),
     )
 
     parser.add_argument(
         "--output-dir",
         type=str,
         default=(
-            "outputs/compact_hgb"
+            "outputs/compact_hgb_36"
         ),
     )
 
@@ -517,32 +519,32 @@ def main() -> None:
         args.train_data
     )
 
-    if (
-        TARGET_COLUMN
-        not in train_df.columns
-    ):
+    if TARGET_COLUMN not in train_df.columns:
         raise ValueError(
             f"Training data does not "
             f"contain '{TARGET_COLUMN}'."
         )
 
-    X = train_df.drop(
-        columns=[
-            TARGET_COLUMN
-        ]
+    X_raw = train_df.drop(
+        columns=[TARGET_COLUMN]
     )
     y = train_df[
         TARGET_COLUMN
     ].astype(int)
 
-    if (
-        set(X.columns)
-        != set(ALL_FEATURES)
+    if set(X_raw.columns) != set(
+        RAW_FEATURES
     ):
         raise ValueError(
-            "Training feature schema "
+            "Raw training feature schema "
             "does not match expected schema."
         )
+
+    X_expanded = (
+        add_domain_features(
+            X_raw
+        )
+    )
 
     feature_payload = json.loads(
         Path(
@@ -576,14 +578,26 @@ def main() -> None:
 
     unknown = sorted(
         set(compact_features)
-        - set(ALL_FEATURES)
+        - set(EXPANDED_FEATURES)
     )
 
     if unknown:
         raise ValueError(
-            "Unknown features in subset: "
+            "Unknown features in compact set: "
             f"{unknown}"
         )
+
+    compact_engineered = [
+        feature
+        for feature in compact_features
+        if feature in ENGINEERED_FEATURES
+    ]
+
+    compact_original = [
+        feature
+        for feature in compact_features
+        if feature not in ENGINEERED_FEATURES
+    ]
 
     print(
         f"Training observations: "
@@ -594,19 +608,32 @@ def main() -> None:
         f"{y.mean():.2%}"
     )
     print(
-        f"Full model features: "
-        f"{len(ALL_FEATURES)}"
+        f"Raw features: "
+        f"{len(RAW_FEATURES)}"
     )
     print(
-        f"Compact model features: "
+        f"Expanded features: "
+        f"{len(EXPANDED_FEATURES)}"
+    )
+    print(
+        f"Compact selected features: "
         f"{len(compact_features)}"
     )
+
     print(
-        "\nCompact feature set:"
+        f"\nCompact original features "
+        f"({len(compact_original)}):"
     )
-    for feature in (
-        compact_features
-    ):
+    for feature in compact_original:
+        print(
+            f"  - {feature}"
+        )
+
+    print(
+        f"\nCompact engineered features "
+        f"({len(compact_engineered)}):"
+    )
+    for feature in compact_engineered:
         print(
             f"  - {feature}"
         )
@@ -614,21 +641,26 @@ def main() -> None:
     cv = StratifiedKFold(
         n_splits=args.cv_folds,
         shuffle=True,
-        random_state=(
-            args.random_state
-        ),
+        random_state=args.random_state,
     )
 
     cv_splits = list(
         cv.split(
-            X,
+            X_raw,
             y,
         )
     )
 
-    full_pipeline = (
+    full_raw_pipeline = (
         build_hgb_pipeline(
-            ALL_FEATURES,
+            RAW_FEATURES,
+            args.random_state,
+        )
+    )
+
+    expanded_pipeline = (
+        build_hgb_pipeline(
+            EXPANDED_FEATURES,
             args.random_state,
         )
     )
@@ -641,37 +673,58 @@ def main() -> None:
     )
 
     print(
-        "\nEvaluating full HGB..."
+        "\nEvaluating full raw HGB "
+        "(23 features)..."
     )
-    full_result = (
+    full_raw_result = (
         evaluate_model(
-            "full_hgb",
-            full_pipeline,
-            X,
+            "full_raw_hgb",
+            full_raw_pipeline,
+            X_expanded,
             y,
             cv_splits,
         )
     )
 
     print(
-        "\nEvaluating compact HGB..."
+        "\nEvaluating expanded HGB "
+        "(36 features)..."
     )
-    compact_result = (
+    expanded_result = (
         evaluate_model(
-            "compact_hgb",
-            compact_pipeline,
-            X,
+            "expanded_hgb",
+            expanded_pipeline,
+            X_expanded,
             y,
             cv_splits,
         )
     )
 
-    comparison_df = (
-        build_fold_comparison(
-            full_result,
-            compact_result,
+    print(
+        "\nEvaluating compact HGB "
+        "(selected from 36)..."
+    )
+    compact_result = (
+        evaluate_model(
+            "compact_hgb",
+            compact_pipeline,
+            X_expanded,
+            y,
+            cv_splits,
         )
     )
+
+    results = {
+        "full_raw_hgb": (
+            full_raw_result
+        ),
+        "expanded_hgb": (
+            expanded_result
+        ),
+        "compact_hgb": (
+            compact_result
+        ),
+    }
 
     output_dir = Path(
         args.output_dir
@@ -681,9 +734,15 @@ def main() -> None:
         exist_ok=True,
     )
 
+    comparison_df = (
+        build_comparison_table(
+            results
+        )
+    )
+
     comparison_df.to_csv(
         output_dir
-        / "fold_comparison.csv",
+        / "fold_comparison_3models.csv",
         index=False,
     )
 
@@ -691,26 +750,30 @@ def main() -> None:
         "feature_source": (
             args.feature_source
         ),
-        "compact_features": (
-            compact_features
+        "raw_feature_count": (
+            len(RAW_FEATURES)
         ),
-        "full_feature_count": (
-            len(ALL_FEATURES)
+        "expanded_feature_count": (
+            len(EXPANDED_FEATURES)
         ),
         "compact_feature_count": (
             len(compact_features)
         ),
-        "full_hgb": (
-            full_result
+        "compact_features": (
+            compact_features
         ),
-        "compact_hgb": (
-            compact_result
+        "compact_original_features": (
+            compact_original
         ),
+        "compact_engineered_features": (
+            compact_engineered
+        ),
+        **results,
     }
 
     with (
         output_dir
-        / "compact_hgb_results.json"
+        / "hgb_3model_comparison.json"
     ).open(
         "w",
         encoding="utf-8",
@@ -721,31 +784,20 @@ def main() -> None:
             indent=2,
         )
 
-    plot_comparison(
-        comparison_df,
+    plot_roc_auc_comparison(
+        results,
         output_dir
-        / "full_vs_compact_roc_auc.png",
-    )
-
-    full_summary = (
-        full_result[
-            "summary"
-        ]
-    )
-    compact_summary = (
-        compact_result[
-            "summary"
-        ]
+        / "hgb_3model_roc_auc.png",
     )
 
     print(
-        "\n\nFull vs Compact HGB"
+        "\n\nHGB comparison"
     )
     print(
-        "==================="
+        "=============="
     )
     print(
-        "Metric       Full HGB   Compact HGB   Compact Δ"
+        "Metric       23 raw     36 expanded   compact"
     )
 
     for metric in [
@@ -756,69 +808,106 @@ def main() -> None:
         "precision",
         "f1",
     ]:
-        full_value = (
-            full_summary[
+        raw_value = (
+            full_raw_result[
+                "summary"
+            ][
+                f"{metric}_mean"
+            ]
+        )
+        expanded_value = (
+            expanded_result[
+                "summary"
+            ][
                 f"{metric}_mean"
             ]
         )
         compact_value = (
-            compact_summary[
+            compact_result[
+                "summary"
+            ][
                 f"{metric}_mean"
             ]
         )
 
         print(
             f"{metric:<12} "
-            f"{full_value:>8.4f} "
-            f"{compact_value:>13.4f} "
-            f"{compact_value - full_value:>11.4f}"
+            f"{raw_value:>8.4f} "
+            f"{expanded_value:>13.4f} "
+            f"{compact_value:>10.4f}"
         )
 
-    full_brier = (
-        full_summary[
+    raw_brier = (
+        full_raw_result[
+            "summary"
+        ][
+            "brier_mean"
+        ]
+    )
+    expanded_brier = (
+        expanded_result[
+            "summary"
+        ][
             "brier_mean"
         ]
     )
     compact_brier = (
-        compact_summary[
+        compact_result[
+            "summary"
+        ][
             "brier_mean"
         ]
     )
 
     print(
         f"{'brier':<12} "
-        f"{full_brier:>8.4f} "
-        f"{compact_brier:>13.4f} "
-        f"{full_brier - compact_brier:>11.4f}"
+        f"{raw_brier:>8.4f} "
+        f"{expanded_brier:>13.4f} "
+        f"{compact_brier:>10.4f}"
     )
 
-    roc_loss = (
-        full_summary[
+    raw_roc = (
+        full_raw_result[
+            "summary"
+        ][
             "roc_auc_mean"
         ]
-        - compact_summary[
+    )
+    compact_roc = (
+        compact_result[
+            "summary"
+        ][
             "roc_auc_mean"
         ]
     )
 
     print(
-        f"\nFeature reduction: "
-        f"{len(ALL_FEATURES)} -> "
+        f"\nFeature reduction vs expanded: "
+        f"{len(EXPANDED_FEATURES)} -> "
         f"{len(compact_features)}"
     )
     print(
-        f"ROC-AUC loss vs full HGB: "
-        f"{roc_loss:.4f}"
+        f"Feature reduction vs raw: "
+        f"{len(RAW_FEATURES)} -> "
+        f"{len(compact_features)}"
     )
+    print(
+        f"Compact ROC-AUC delta vs 23 raw: "
+        f"{compact_roc - raw_roc:+.4f}"
+    )
+
     print(
         f"\nArtifacts written to: "
         f"{output_dir}"
     )
+
     print(
-        "\nInterpretation rule:"
-        "\nA compact model is attractive only if the feature reduction is "
-        "substantial and the CV loss is practically small."
-        "\nDo not use the holdout to tune the subset."
+        "\nInterpretation:"
+        "\n- 23 raw HGB remains the current benchmark."
+        "\n- 36 expanded HGB tests whether engineering adds signal."
+        "\n- Compact HGB tests whether engineered summaries can replace "
+        "multiple raw monthly variables."
+        "\n- Do not use the holdout to tune the subset."
     )
 
 
