@@ -1,17 +1,21 @@
 """
-Preprocessing component for the DKV Mobility Azure ML interview case.
+Data preparation / deterministic preprocessing component for the
+DKV Mobility Azure ML interview case.
 
 Responsibilities:
-- Load the UCI Credit Card Default dataset.
+- Load the raw UCI Credit Card Default dataset.
 - Validate the expected schema and target.
-- Apply deterministic, domain-based cleaning only.
+- Apply deterministic, domain-based preprocessing rules.
 - Create a reproducible stratified train/test split.
 - Persist train and test datasets.
 
 Important:
-Learned preprocessing such as imputation, scaling, encoding, feature
-selection, etc. is intentionally NOT performed here. Those transformations
-belong in the scikit-learn Pipeline fitted on training data in train.py.
+No data-dependent transformations are fitted here.
+
+Learned feature preprocessing such as scaling, encoding, imputation,
+feature selection, or resampling is intentionally NOT performed here.
+Those transformations are fitted only on training data inside the
+scikit-learn Pipeline in train.py.
 """
 
 from __future__ import annotations
@@ -56,7 +60,6 @@ FEATURE_NAME_MAP = {
 
 EXPECTED_FEATURE_COUNT = 23
 
-
 def load_dataset() -> pd.DataFrame:
     """Load the UCI Credit Card Default dataset."""
 
@@ -73,22 +76,21 @@ def load_dataset() -> pd.DataFrame:
 
     if target.shape[1] != 1:
         raise ValueError(
-            f"Expected exactly one target column, but received {target.shape[1]}."
+            f"Expected exactly one target column, "
+            f"but received {target.shape[1]}."
         )
 
-    # Normalize the UCI technical feature names into readable names.
+    # Deterministic renaming only; no parameters are learned from the data.
     features = features.rename(columns=FEATURE_NAME_MAP)
 
     target = target.iloc[:, 0].rename(TARGET_COLUMN)
 
-    df = pd.concat([features, target], axis=1)
-
-    return df
+    return pd.concat([features, target], axis=1)
 
 
 def validate_schema(df: pd.DataFrame) -> None:
     """
-    Validate structural assumptions without learning anything from the data.
+    Validate structural assumptions without learning parameters from the data.
     """
 
     expected_columns = set(FEATURE_NAME_MAP.values()) | {TARGET_COLUMN}
@@ -99,12 +101,14 @@ def validate_schema(df: pd.DataFrame) -> None:
 
     if missing_columns:
         raise ValueError(
-            f"Dataset is missing expected columns: {sorted(missing_columns)}"
+            f"Dataset is missing expected columns: "
+            f"{sorted(missing_columns)}"
         )
 
     if unexpected_columns:
         raise ValueError(
-            f"Dataset contains unexpected columns: {sorted(unexpected_columns)}"
+            f"Dataset contains unexpected columns: "
+            f"{sorted(unexpected_columns)}"
         )
 
     if df.empty:
@@ -117,41 +121,50 @@ def validate_schema(df: pd.DataFrame) -> None:
 
     if target_values != {0, 1}:
         raise ValueError(
-            f"Expected binary target values {{0, 1}}, found {target_values}."
+            f"Expected binary target values {{0, 1}}, "
+            f"found {target_values}."
         )
 
 
-def deterministic_cleaning(df: pd.DataFrame) -> pd.DataFrame:
+def apply_deterministic_preprocessing(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
     """
-    Apply fixed, domain-based cleaning rules.
+    Apply fixed, domain-based preprocessing rules.
 
-    These transformations do not estimate parameters from the sample and
-    therefore can be applied identically to train and test data.
+    These transformations do not estimate parameters from the sample.
+    Therefore, the same rules can be applied independently to training
+    and test data without introducing data leakage.
 
     UCI documents:
-      education: 1=graduate school, 2=university, 3=high school, 4=other
+      education: 1=graduate school, 2=university,
+                 3=high school, 4=other
       marriage:  1=married, 2=single, 3=other
 
     Historical versions of this dataset contain additional undocumented
     category codes. They are deterministically mapped to "other".
     """
 
-    cleaned = df.copy()
+    prepared = df.copy()
 
     # Undocumented EDUCATION codes (0, 5, 6) -> "other" (4).
-    cleaned["education"] = cleaned["education"].replace(
+    prepared["education"] = prepared["education"].replace(
         {0: 4, 5: 4, 6: 4}
     )
 
     # Undocumented MARRIAGE code 0 -> "other" (3).
-    cleaned["marriage"] = cleaned["marriage"].replace({0: 3})
+    prepared["marriage"] = prepared["marriage"].replace({0: 3})
 
-    cleaned[TARGET_COLUMN] = cleaned[TARGET_COLUMN].astype(int)
+    prepared[TARGET_COLUMN] = prepared[TARGET_COLUMN].astype(int)
 
-    return cleaned
+    return prepared
 
 
-def save_dataset(df: pd.DataFrame, output_dir: str, filename: str) -> Path:
+def save_dataset(
+    df: pd.DataFrame,
+    output_dir: str,
+    filename: str,
+) -> Path:
     """Persist a dataframe to an output directory."""
 
     output_path = Path(output_dir)
@@ -161,6 +174,7 @@ def save_dataset(df: pd.DataFrame, output_dir: str, filename: str) -> Path:
     df.to_csv(file_path, index=False)
 
     return file_path
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for local or Azure ML execution."""
     parser = argparse.ArgumentParser()
@@ -201,6 +215,8 @@ def main() -> None:
     print("Loading UCI Credit Card Default dataset...")
     df = load_dataset()
 
+    # Structural validation is performed before the split because it does
+    # not estimate any parameters from the data.
     validate_schema(df)
 
     print(f"Loaded observations: {len(df):,}")
@@ -210,7 +226,7 @@ def main() -> None:
         f"{df[TARGET_COLUMN].mean():.2%}"
     )
 
-    # Split BEFORE any learned preprocessing.
+    # Split BEFORE any learned feature preprocessing.
     train_df, test_df = train_test_split(
         df,
         test_size=args.test_size,
@@ -218,9 +234,9 @@ def main() -> None:
         stratify=df[TARGET_COLUMN],
     )
 
-    # Fixed deterministic rules are applied independently to both partitions.
-    train_df = deterministic_cleaning(train_df)
-    test_df = deterministic_cleaning(test_df)
+    # Apply identical fixed rules independently to both partitions.
+    train_df = apply_deterministic_preprocessing(train_df)
+    test_df = apply_deterministic_preprocessing(test_df)
 
     train_path = save_dataset(
         train_df,
