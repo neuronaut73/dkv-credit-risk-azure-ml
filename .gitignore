@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local Python / Conda environments
+.venv/
+venv/
+.env
+
+# Azure local configuration
+.azureml/
+
+# Local test / connection helper
+test_connection.py
+
+# MLflow local artifacts
+mlruns/
+
+# Generated outputs
+outputs/
+artifacts/
+
+# Generated datasets
+data/processed/
+data/interim/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
