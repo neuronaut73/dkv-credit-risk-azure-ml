@@ -5,8 +5,8 @@ Responsibilities:
 - Load the training partition produced by preprocess.py.
 - Build learned feature transformations.
 - Combine feature transformation and estimation in scikit-learn Pipelines.
-- Compare a naive baseline, an interpretable baseline, and nonlinear
-  challengers using leakage-safe stratified cross-validation.
+- Compare an interpretable baseline with a nonlinear challenger using
+  leakage-safe stratified cross-validation.
 - Fit the selected complete pipeline on the full training partition.
 - Persist the fitted feature transformation + model as one deployable artifact.
 
@@ -32,12 +32,17 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, make_scorer
+from sklearn.metrics import (
+    brier_score_loss,
+    f1_score,
+    make_scorer,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.dummy import DummyClassifier
-from xgboost import XGBClassifier
 
 
 TARGET_COLUMN = "default"
@@ -105,7 +110,7 @@ def build_candidates(
     random_state: int,
 ) -> dict[str, Pipeline]:
     """
-    Define a naive baseline, an interpretable baseline, and nonlinear challengers.
+    Define an interpretable baseline and a nonlinear challenger.
 
     Each candidate contains both learned feature transformation and model,
     ensuring that cross-validation evaluates the complete ML pipeline.
@@ -144,31 +149,6 @@ def build_candidates(
         ]
     )
     
-
-    xgboost_pipeline = Pipeline(
-        steps=[
-            (
-                "feature_transformer",
-                build_feature_transformer(),
-            ),
-            (
-                "classifier",
-                XGBClassifier(
-                    objective="binary:logistic",
-                    eval_metric="logloss",
-                    n_estimators=300,
-                    learning_rate=0.05,
-                    max_depth=3,
-                    subsample=0.8,
-                    colsample_bytree=0.8,
-                    tree_method="hist",
-                    random_state=random_state,
-                    n_jobs=1,
-                ),
-            ),
-        ]
-    )
-
     dummy_pipeline = Pipeline(
     steps=[
         (
@@ -188,7 +168,6 @@ def build_candidates(
         "dummy_prior": dummy_pipeline,
         "logistic_regression": logistic_pipeline,
         "hist_gradient_boosting": boosting_pipeline,
-        "xgboost": xgboost_pipeline,
     }
 
 
@@ -209,9 +188,18 @@ def evaluate_candidates(
         "accuracy": "accuracy",
         "roc_auc": "roc_auc",
         "pr_auc": "average_precision",
-        "precision": "precision",
-        "recall": "recall",        
-        "f1": "f1",
+        "precision": make_scorer(
+            precision_score,
+            zero_division=0,
+        ),
+        "recall": make_scorer(
+            recall_score,
+            zero_division=0,
+        ),
+        "f1": make_scorer(
+            f1_score,
+            zero_division=0,
+        ),
         "neg_brier": make_scorer(
             brier_score_loss,
             response_method="predict_proba",
@@ -255,11 +243,6 @@ def evaluate_candidates(
 
         results[model_name] = model_result
 
-        print(
-            f"Accuracy: "
-            f"{model_result['accuracy_mean']:.4f} "
-            f"(+/- {model_result['accuracy_std']:.4f})"
-        )
         print(
             f"ROC-AUC:  "
             f"{model_result['roc_auc_mean']:.4f} "
