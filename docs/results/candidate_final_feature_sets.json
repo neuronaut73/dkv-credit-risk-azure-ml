@@ -1,0 +1,54 @@
+{
+  "raw": {
+    "selector_best_params": {
+      "classifier__C": 0.1,
+      "classifier__l1_ratio": 0.5
+    },
+    "top_6": [
+      "education",
+      "pay_0",
+      "bill_amt1",
+      "pay_amt1",
+      "pay_amt2",
+      "marriage"
+    ],
+    "top_10": [
+      "education",
+      "pay_0",
+      "bill_amt1",
+      "pay_amt1",
+      "pay_amt2",
+      "marriage",
+      "limit_bal",
+      "sex",
+      "pay_3",
+      "pay_2"
+    ]
+  },
+  "expanded": {
+    "selector_best_params": {
+      "classifier__C": 0.3,
+      "classifier__l1_ratio": 0.8
+    },
+    "top_6": [
+      "severe_delinquent_months",
+      "education",
+      "mean_payment_amount",
+      "payment_amount_std",
+      "delinquent_months",
+      "max_delinquency"
+    ],
+    "top_10": [
+      "severe_delinquent_months",
+      "education",
+      "mean_payment_amount",
+      "payment_amount_std",
+      "delinquent_months",
+      "max_delinquency",
+      "pay_0",
+      "limit_bal",
+      "pay_3",
+      "bill_amt2"
+    ]
+  }
+}

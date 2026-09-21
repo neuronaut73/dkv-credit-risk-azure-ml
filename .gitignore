@@ -29,3 +29,24 @@ data/interim/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local / generated artifacts
+DataScience-Interview.zip
+mlflow.db
+azure-downloads/
+outputs/
+mlruns/
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pkl
+*.joblib
+
+# Environments / secrets
+.env
+.venv/
+
+# OS
+.DS_Store

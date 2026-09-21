@@ -1,0 +1,22 @@
+{
+  "note": "Local mirror of metadata written by src/train_compact_azure.py in the Azure ML compact-model job.",
+  "model_role": "interpretable_compact_challenger",
+  "algorithm": "HistGradientBoostingClassifier",
+  "feature_count": 10,
+  "selected_features": [
+    "severe_delinquent_months",
+    "education",
+    "mean_payment_amount",
+    "payment_amount_std",
+    "delinquent_months",
+    "max_delinquency",
+    "pay_0",
+    "limit_bal",
+    "pay_3",
+    "bill_amt2"
+  ],
+  "feature_space": "23 original + 13 deterministic engineered candidates",
+  "selection_method": "Nested-CV Elastic-Net ranking with exact feature budget=10",
+  "threshold": 0.5,
+  "random_state": 42
+}

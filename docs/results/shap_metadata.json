@@ -1,0 +1,38 @@
+{
+  "model_role": "interpretable_compact_challenger",
+  "model_path": "outputs/model_compact_10/model.joblib",
+  "feature_set_source": "outputs/budget_feature_selection/candidate_final_feature_sets.json",
+  "selected_features": [
+    "severe_delinquent_months",
+    "education",
+    "mean_payment_amount",
+    "payment_amount_std",
+    "delinquent_months",
+    "max_delinquency",
+    "pay_0",
+    "limit_bal",
+    "pay_3",
+    "bill_amt2"
+  ],
+  "background_rows": 100,
+  "global_explanation_rows": 400,
+  "shap_algorithm": "permutation",
+  "model_output": "predicted default probability",
+  "permutation_rounds": 5,
+  "max_evals_per_explanation": 135,
+  "local_case_selection": {
+    "rule": "closest holdout prediction to 90% predicted-risk percentile",
+    "holdout_row_position": 1255,
+    "predicted_default_probability": 0.568125639922853,
+    "actual_default": 1,
+    "base_probability": 0.217443130110337,
+    "base_plus_shap_sum": 0.568125639922854,
+    "additivity_difference": 9.992007221626409e-16
+  },
+  "notes": [
+    "The true target was not used to select the local example.",
+    "One-hot SHAP contributions are aggregated back to source features.",
+    "SHAP describes model behaviour, not causality.",
+    "Correlated features can redistribute SHAP attribution."
+  ]
+}

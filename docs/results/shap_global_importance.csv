@@ -1,0 +1,11 @@
+feature,mean_abs_shap,feature_type
+max_delinquency,0.07197060909224506,engineered
+pay_0,0.04071787143977791,original
+mean_payment_amount,0.026986672963745385,engineered
+limit_bal,0.0259686712689904,original
+delinquent_months,0.014612499082407679,engineered
+bill_amt2,0.014213200339943586,original
+payment_amount_std,0.012089180785551466,engineered
+pay_3,0.004932800893645302,original
+severe_delinquent_months,0.004350177059345892,engineered
+education,0.0039052524840687925,original
