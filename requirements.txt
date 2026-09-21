@@ -1,12 +1,23 @@
+# Azure ML / experiment tracking
 azure-ai-ml==1.35.0
 azure-identity==1.25.3
-
-pandas==2.3.3
-scikit-learn==1.7.2
-matplotlib==3.10.9
-joblib
-
-mlflow==2.16.2
 azureml-mlflow==1.60.0
+mlflow==3.16.1
 
-ucimlrepo
+# Core data science stack
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.2
+joblib==1.6.0
+matplotlib==3.10.9
+
+# Dataset access
+ucimlrepo==0.0.7
+
+# EDA / explainability
+sweetviz==2.3.3
+shap==0.49.1
+
+# Optional benchmark model used during experimentation
+xgboost==3.2.0
